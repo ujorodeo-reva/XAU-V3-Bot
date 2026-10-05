@@ -1,171 +1,123 @@
-import os, time, threading, requests
-import pandas as pd
+import os
+import time
+import threading
+import requests
 from flask import Flask
+from datetime import datetime
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+PORT = int(os.getenv("PORT", 10000))
+
 SYMBOL = "PAXGUSDT"
+INTERVAL = "1m"
+SL_PERCENT = 0.006 # 0.6% SL
+TP_PERCENT = 0.012 # 1.2% TP = 1:2 RR
 
 app = Flask(__name__)
+active_trade = None
 last_price = 0
 last_rsi = 0
-last_check = "Never"
-active_trade = None
+last_update = "Never"
 
-def send_tg(text):
+def send_telegram(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        print(f"SEND FAIL {e}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except: pass
 
 def get_klines():
-    # 1. Try Binance
-    urls = [
-        f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=5m&limit=100",
-        f"https://data-api.binance.vision/api/v3/klines?symbol={SYMBOL}&interval=5m&limit=100",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-            if isinstance(r, list) and len(r)>5:
-                df = pd.DataFrame(r, columns=["t","o","h","l","c","v","ct","q","n","tb","tq","ig"])
-                for col in ["o","h","l","c","v"]: df[col]=df[col].astype(float)
-                print(f"OK BINANCE {url[:30]}")
-                return df
-        except Exception as e:
-            print(f"FAIL BINANCE {e}")
-
-    # 2. Try OKX - this works on Render
     try:
-        url = "https://www.okx.com/api/v5/market/candles?instId=PAXG-USDT&bar=5m&limit=100"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-        data = r.get("data", [])
-        if data and len(data)>5:
-            data = list(reversed(data)) # OKX returns newest first
-            df = pd.DataFrame(data, columns=["t","o","h","l","c","v","volCcy","volCcyQ","c2"])
-            for col in ["o","h","l","c","v"]: df[col]=df[col].astype(float)
-            print(f"OK OKX candles {len(df)}")
-            return df
-    except Exception as e:
-        print(f"FAIL OKX {e}")
-
-    # 3. Last resort - get price only from CoinGecko for /status
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies=usd", timeout=10).json()
-        price = float(r["pax-gold"]["usd"])
-        print(f"OK COINGECKO price {price}")
-        # create fake df with that price
-        df = pd.DataFrame({"c":[price]*30, "v":[1]*30, "o":[price]*30, "h":[price]*30, "l":[price]*30})
-        return df
-    except Exception as e:
-        print(f"FAIL COINGECKO {e}")
-
-    return None
-
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def check_market():
-    global last_price, last_rsi, last_check, active_trade
-    print("MARKET CHECK THREAD STARTED", flush=True)
-    time.sleep(3)
-    while True:
+        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit=100"
+        r = requests.get(url, timeout=10).json()
+        closes = [float(x[4]) for x in r]
+        volumes = [float(x[5]) for x in r]
+        return closes, volumes
+    except:
         try:
-            df = get_klines()
-            if df is None or len(df) < 20:
-                print("No data, retry 30s", flush=True)
-                time.sleep(30)
-                continue
+            url = f"https://www.okx.com/api/v5/market/candles?instId=PAXG-USDT&bar={INTERVAL}&limit=100"
+            r = requests.get(url, timeout=10).json()
+            data = r['data'][::-1]
+            closes = [float(x[4]) for x in data]
+            volumes = [float(x[5]) for x in data]
+            return closes, volumes
+        except: return None, None
 
-            df["ema9"] = df["c"].ewm(span=9).mean()
-            df["ema21"] = df["c"].ewm(span=21).mean()
-            df["ema20"] = df["c"].ewm(span=20).mean()
-            df["rsi"] = calc_rsi(df["c"], 14)
-            df["vol_ma20"] = df["v"].rolling(20).mean()
-            df["roc"] = df["c"].pct_change(3) * 100
+def calc_ema(prices, period):
+    ema = prices[0]
+    k = 2/(period+1)
+    for p in prices[1:]: ema = p*k + ema*(1-k)
+    return ema
 
-            c0 = df.iloc[-1]
-            c1 = df.iloc[-2]
-            price = float(c0["c"])
-            rsi = float(c0["rsi"]) if not pd.isna(c0["rsi"]) else 50
+def calc_rsi(prices, period=14):
+    gains=[]; losses=[]
+    for i in range(1,len(prices)):
+        d=prices[i]-prices[i-1]
+        gains.append(max(d,0)); losses.append(max(-d,0))
+    if len(gains)<period: return 50
+    ag=sum(gains[-period:])/period; al=sum(losses[-period:])/period
+    if al==0: return 70
+    return 100-(100/(1+ag/al))
 
-            last_price = price
-            last_rsi = rsi
-            last_check = time.strftime("%H:%M:%S")
-            print(f"CHECK {price:.2f} RSI {rsi:.1f}", flush=True)
+def check_signal():
+    global last_price, last_rsi, last_update, active_trade
+    closes, volumes = get_klines()
+    if not closes: return
+    price=closes[-1]; last_price=price; last_update=datetime.now().strftime("%H:%M:%S")
+    ema9=calc_ema(closes[-21:],9); ema21=calc_ema(closes[-21:],21); ema20=calc_ema(closes[-20:],20)
+    rsi=calc_rsi(closes,14); last_rsi=rsi
+    roc=((closes[-1]-closes[-6])/closes[-6])*100 if len(closes)>6 else 0
+    avg_vol=sum(volumes[-20:-1])/19 if len(volumes)>20 else volumes[-1]
+    vol_surge=volumes[-1]>avg_vol*1.2; vol_inc=volumes[-1]>volumes[-2]
 
-            if active_trade:
-                entry = active_trade["entry"]
-                if active_trade["dir"] == "BUY":
-                    if price >= active_trade["tp"]:
-                        send_tg(f"✅ <b>TP HIT BUY</b>\nEntry {entry:.2f} -> {price:.2f}\n+{price-entry:.2f}")
-                        active_trade=None
-                    elif price <= active_trade["sl"]:
-                        send_tg(f"❌ <b>SL HIT BUY</b>\nEntry {entry:.2f} -> {price:.2f}")
-                        active_trade=None
-                else:
-                    if price <= active_trade["tp"]:
-                        send_tg(f"✅ <b>TP HIT SELL</b>\nEntry {entry:.2f} -> {price:.2f}")
-                        active_trade=None
-                    elif price >= active_trade["sl"]:
-                        send_tg(f"❌ <b>SL HIT SELL</b>\nEntry {entry:.2f} -> {price:.2f}")
-                        active_trade=None
-                if active_trade:
-                    time.sleep(60); continue
+    if active_trade:
+        e=active_trade['entry']; t=active_trade['type']; tp=active_trade['tp']; sl=active_trade['sl']
+        if t=="BUY":
+            if price>=tp: send_telegram(f"✅ TP HIT BUY (1:2)\n+{price-e:.2f} (+1.2%)"); active_trade=None
+            elif price<=sl: send_telegram(f"❌ SL HIT BUY\n{price-e:.2f}"); active_trade=None
+        else:
+            if price<=tp: send_telegram(f"✅ TP HIT SELL (1:2)\n+{e-price:.2f} (+1.2%)"); active_trade=None
+            elif price>=sl: send_telegram(f"❌ SL HIT SELL\n{e-price:.2f}"); active_trade=None
+        return
 
-            vol_surge = c0["v"] > c0["vol_ma20"] if not pd.isna(c0["vol_ma20"]) else True
-            vol_inc = c0["v"] >= c1["v"]
-            if not (vol_surge and vol_inc):
-                time.sleep(60); continue
+    if not (vol_surge and vol_inc): return
+    prev_rsi=calc_rsi(closes[:-1],14)
 
-            buy_mom = (c0["ema9"] > c1["ema9"]) and (c0["rsi"] > c1["rsi"]) and (c0["roc"] > 0)
-            sell_mom = (c0["ema9"] < c1["ema9"]) and (c0["rsi"] < c1["rsi"]) and (c0["roc"] < 0)
+    score=0
+    if price>ema20: score+=1
+    if ema9>ema21: score+=1
+    if 35<rsi<70 and rsi>prev_rsi: score+=1
+    if roc>0.05: score+=1
+    if score>=3:
+        tp=price*(1+TP_PERCENT); sl=price*(1-SL_PERCENT)
+        active_trade={"type":"BUY","entry":price,"tp":tp,"sl":sl}
+        send_telegram(f"🟢 BUY V8.3 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↑ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (+1.2%) SL {sl:.2f} (-0.6%)")
+        return
 
-            buy_score = (1 if price > c0["ema20"] else 0) + (1 if c0["ema9"] > c0["ema21"] else 0) + (1 if rsi < 65 else 0) + (1 if c0["roc"] > 0.05 else 0)
-            sell_score = (1 if price < c0["ema20"] else 0) + (1 if c0["ema9"] < c0["ema21"] else 0) + (1 if rsi > 35 else 0) + (1 if c0["roc"] < -0.05 else 0)
+    score=0
+    if price<ema20: score+=1
+    if ema9<ema21: score+=1
+    if 30<rsi<65 and rsi<prev_rsi: score+=1
+    if roc<-0.05: score+=1
+    if score>=3:
+        tp=price*(1-TP_PERCENT); sl=price*(1+SL_PERCENT)
+        active_trade={"type":"SELL","entry":price,"tp":tp,"sl":sl}
+        send_telegram(f"🔴 SELL V8.3 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↓ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (-1.2%) SL {sl:.2f} (+0.6%)")
 
-            if buy_mom and buy_score>=3:
-                tp = price*1.006; sl=price*0.996
-                active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
-                send_tg(f"🟢 <b>BUY V8.2 POWER</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↑ Vol INC\nROC {c0['roc']:.2f}%\nScore {buy_score}/4\nTP {tp:.2f} SL {sl:.2f}")
-            elif sell_mom and sell_score>=3:
-                tp=price*0.994; sl=price*1.004
-                active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
-                send_tg(f"🔴 <b>SELL V8.2 POWER</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↓ Vol INC\nROC {c0['roc']:.2f}%\nScore {sell_score}/4\nTP {tp:.2f} SL {sl:.2f}")
-
-            time.sleep(60)
-        except Exception as e:
-            print(f"CHECK ERR {e}", flush=True)
-            time.sleep(10)
-
-def telegram_loop():
-    print("BOT POLLING STARTED", flush=True)
-    offset=0
+def bot_loop():
+    send_telegram("✅ XAU V8.3 POWER LIVE - 1:2 RR\nSL 0.6% | TP 1.2% | Waiting for signal...")
     while True:
-        try:
-            r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset":offset,"timeout":25}, timeout=30).json()
-            for upd in r.get("result", []):
-                offset=upd["update_id"]+1
-                msg=upd.get("message",{}); text=msg.get("text",""); chat=str(msg.get("chat",{}).get("id",""))
-                if chat!=CHAT_ID: continue
-                if "/status" in text or "/start" in text:
-                    tr="No active trade"
-                    if active_trade: tr=f"{active_trade['dir']} {active_trade['entry']:.2f} TP {active_trade['tp']:.2f} SL {active_trade['sl']:.2f}"
-                    send_tg(f"✅ <b>XAU V8.2 POWER LIVE</b>\nPrice: {last_price:.2f}\nRSI: {last_rsi:.2f}\nLast: {last_check}\nTrade: {tr}")
-        except Exception as e:
-            print(f"POLL ERR {e}", flush=True)
-            time.sleep(3)
+        try: check_signal()
+        except: pass
+        time.sleep(60)
 
 @app.route("/")
-def home(): return f"XAU V8.2 {last_price} {last_check}"
+def home(): return f"V8.3 1:2 LIVE | {last_price:.2f} RSI {last_rsi:.2f} {last_update} Trade:{active_trade}"
 
-threading.Thread(target=telegram_loop, daemon=True).start()
-threading.Thread(target=check_market, daemon=True).start()
+@app.route("/status")
+def status():
+    ts = f"{active_trade['type']} @ {active_trade['entry']:.2f}" if active_trade else "No active trade - hunting"
+    return f"✅ V8.3 POWER 1:2\nPrice {last_price:.2f}\nRSI {last_rsi:.2f}\nLast {last_update}\nTrade: {ts}"
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+threading.Thread(target=bot_loop, daemon=True).start()
+if __name__=="__main__": app.run(host="0.0.0.0",port=PORT)
