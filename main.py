@@ -11,14 +11,15 @@ PORT = int(os.getenv("PORT", 10000))
 
 SYMBOL = "PAXGUSDT"
 INTERVAL = "1m"
-SL_PERCENT = 0.006 # 0.6% SL
-TP_PERCENT = 0.012 # 1.2% TP = 1:2 RR
+SL_PERCENT = 0.006
+TP_PERCENT = 0.012 # 1:2
 
 app = Flask(__name__)
 active_trade = None
 last_price = 0
 last_rsi = 0
 last_update = "Never"
+last_telegram_update_id = 0
 
 def send_telegram(msg):
     try:
@@ -82,7 +83,6 @@ def check_signal():
 
     if not (vol_surge and vol_inc): return
     prev_rsi=calc_rsi(closes[:-1],14)
-
     score=0
     if price>ema20: score+=1
     if ema9>ema21: score+=1
@@ -91,9 +91,8 @@ def check_signal():
     if score>=3:
         tp=price*(1+TP_PERCENT); sl=price*(1-SL_PERCENT)
         active_trade={"type":"BUY","entry":price,"tp":tp,"sl":sl}
-        send_telegram(f"🟢 BUY V8.3 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↑ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (+1.2%) SL {sl:.2f} (-0.6%)")
+        send_telegram(f"🟢 BUY V8.4 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↑ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (+1.2%) SL {sl:.2f} (-0.6%)")
         return
-
     score=0
     if price<ema20: score+=1
     if ema9<ema21: score+=1
@@ -102,22 +101,34 @@ def check_signal():
     if score>=3:
         tp=price*(1-TP_PERCENT); sl=price*(1+SL_PERCENT)
         active_trade={"type":"SELL","entry":price,"tp":tp,"sl":sl}
-        send_telegram(f"🔴 SELL V8.3 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↓ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (-1.2%) SL {sl:.2f} (+0.6%)")
+        send_telegram(f"🔴 SELL V8.4 POWER 1:2\nPrice {price:.2f}\nRSI {rsi:.1f}↓ ROC {roc:.2f}% Score {score}/4\nTP {tp:.2f} (-1.2%) SL {sl:.2f} (+0.6%)")
+
+def telegram_command_listener():
+    global last_telegram_update_id
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_telegram_update_id+1}&timeout=20"
+            r = requests.get(url, timeout=25).json()
+            if "result" in r:
+                for update in r["result"]:
+                    last_telegram_update_id = update["update_id"]
+                    if "message" in update and "text" in update["message"]:
+                        txt = update["message"]["text"].strip().lower()
+                        if txt in ["/status", "status", "/price", "/info"]:
+                            trade_info = "No active trade - hunting" if not active_trade else f"{active_trade['type']} Entry {active_trade['entry']:.2f} TP {active_trade['tp']:.2f} SL {active_trade['sl']:.2f}"
+                            reply = f"✅ V8.4 POWER 1:2\nPrice: {last_price:.2f}\nRSI: {last_rsi:.2f}\nLast Check: {last_update}\nTrade: {trade_info}\nRR: 1:2 (0.6% SL / 1.2% TP)"
+                            send_telegram(reply)
+                        elif txt in ["/help", "help"]:
+                            send_telegram("Commands:\n/status - current price & trade\n/price - same as status")
+        except: pass
+        time.sleep(3)
 
 def bot_loop():
-    send_telegram("✅ XAU V8.3 POWER LIVE - 1:2 RR\nSL 0.6% | TP 1.2% | Waiting for signal...")
+    send_telegram("✅ XAU V8.4 POWER LIVE - 1:2 RR + /status reply\nSL 0.6% | TP 1.2% | Send /status in Telegram")
     while True:
         try: check_signal()
         except: pass
         time.sleep(60)
 
 @app.route("/")
-def home(): return f"V8.3 1:2 LIVE | {last_price:.2f} RSI {last_rsi:.2f} {last_update} Trade:{active_trade}"
-
-@app.route("/status")
-def status():
-    ts = f"{active_trade['type']} @ {active_trade['entry']:.2f}" if active_trade else "No active trade - hunting"
-    return f"✅ V8.3 POWER 1:2\nPrice {last_price:.2f}\nRSI {last_rsi:.2f}\nLast {last_update}\nTrade: {ts}"
-
-threading.Thread(target=bot_loop, daemon=True).start()
-if __name__=="__main__": app.run(host="0.0.0.0",port=PORT)
+def home(): return f"V8.4 1:2 LIVE | {last_price:.2f} RSI {last_r
