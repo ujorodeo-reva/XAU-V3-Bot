@@ -5,113 +5,138 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = "GC=F"
-RSI_PERIOD = 14
-VOL_MULT = 0.10  # <-- FIXED for GC=F: Yahoo volume is always 0.13-0.18x
 SCAN_SECONDS = 60
+VOL_MULT = 0.10
 
-last_state = {"rsi":0,"vol":0,"price":0,"status":"starting"}
+last_state = {"price":0,"rsi":0,"vol":0,"ma200":0,"status":"starting"}
 last_update = "never"
+active_trade = None  # {type, entry, sl, tp, time}
+last_signal_candle = None
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
 
-def rsi_calc(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss.replace(0, 0.00001)
-    return 100 - (100/(1+rs))
+def rsi_calc(s, p=14):
+    d = s.diff(); g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
+    l = -d.clip(upper=0).ewm(alpha=1/p, adjust=False).mean()
+    return 100 - (100/(1+g/l.replace(0,0.00001)))
 
-def send_telegram(text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown"}, timeout=15)
-        log(f"TG sent: {text[:70]}")
-    except Exception as e:
-        log(f"TG error: {e}")
+def send_telegram(t):
+    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":t,"parse_mode":"Markdown"}, timeout=15)
+    except Exception as e: log(f"TG err {e}")
 
 def fetch():
     try:
-        df = yf.download(SYMBOL, period="2d", interval="15m", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 30:
-            log("fetch empty, will retry")
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df["rsi"] = rsi_calc(df["Close"], RSI_PERIOD)
-        df["vol_ma20"] = df["Volume"].rolling(20).mean()
+        df = yf.download(SYMBOL, period="6mo", interval="15m", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 210: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df["rsi"]=rsi_calc(df["Close"]); df["ma9"]=df["Close"].rolling(9).mean()
+        df["ma20"]=df["Close"].rolling(20).mean(); df["ma200"]=df["Close"].rolling(200).mean()
+        df["vol_ma20"]=df["Volume"].rolling(20).mean()
         return df
     except Exception as e:
-        # This catches the 429 crumb error you saw
-        if "429" in str(e) or "Too Many Requests" in str(e):
-            log(f"Yahoo rate-limited 429, cooling down 120s")
-            time.sleep(120)
-        else:
-            log(f"fetch error: {e}")
+        if "429" in str(e): time.sleep(120)
         return None
 
+def detect_sr(df):
+    recent = df.tail(50)
+    sup = recent.nsmallest(3,"Low")["Low"].mean()
+    res = recent.nlargest(3,"High")["High"].mean()
+    return sup, res
+
 def check_loop():
-    global last_state, last_update
-    log("Bot started... scanning XAU")
+    global last_state, last_update, active_trade, last_signal_candle
+    log("V7 TP/SL Bot started")
     time.sleep(5)
     while True:
         df = fetch()
         if df is None:
-            last_state["status"] = "waiting data (yahoo 429)"
-            time.sleep(30)
-            continue
-            
-        last = df.iloc[-1]
-        price = float(last["Close"])
-        rsi = float(last["rsi"])
-        vol = float(last["Volume"])
-        vol_ma = float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0
+            time.sleep(30); continue
 
-        # FIX FOR GC=F VOLUME
-        if vol_ma == 0 or vol_ma < 1:
-            vol_ratio = 1.0
-        else:
-            vol_ratio = vol / vol_ma
-        if vol_ratio < 0.05:  # Yahoo bad data
-            vol_ratio = 1.0
+        last = df.iloc[-1]; prev1=df.iloc[-2]; prev2=df.iloc[-3]; prev3=df.iloc[-4]
+        price = float(last["Close"]); rsi=float(last["rsi"])
+        ma9=float(last["ma9"]); ma20=float(last["ma20"]); ma200=float(last["ma200"])
+        vol_ma=float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0
+        vol_ratio = 1.0 if vol_ma < 1 else float(last["Volume"])/vol_ma
+        if vol_ratio < 0.05: vol_ratio = 1.0
 
-        last_state = {"rsi":round(rsi,2),"vol":round(vol_ratio,2),"price":round(price,2),"status":"running"}
+        support, resistance = detect_sr(df)
+        near_sup = abs(price-support)/price < 0.003
+        near_res = abs(price-resistance)/price < 0.003
+        cross_up = ma9>ma20 and (prev1["ma9"]<=prev1["ma20"] or prev2["ma9"]<=prev2["ma20"] or prev3["ma9"]<=prev3["ma20"])
+        cross_down = ma9<ma20 and (prev1["ma9"]>=prev1["ma20"] or prev2["ma9"]>=prev2["ma20"] or prev3["ma9"]>=prev3["ma20"])
+
+        last_state = {"price":round(price,2),"rsi":round(rsi,2),"vol":round(vol_ratio,2),"ma200":round(ma200,2),"status":f"{'ABOVE' if price>ma200 else 'BELOW'}200"}
         last_update = datetime.now().strftime("%H:%M:%S")
-        log(f"{price:.2f} RSI:{rsi:.1f} Vol:{vol_ratio:.2f}x")
 
-        # SIGNAL LOGIC
-        if rsi < 30 and vol_ratio >= VOL_MULT:
-            send_telegram(f"🟢 *XAU BUY SIGNAL*\nPrice: {price:.2f}\nRSI: {rsi:.1f} (Oversold)\nVol: {vol_ratio:.2f}x\nTime: {last_update}")
-        elif rsi > 70 and vol_ratio >= VOL_MULT:
-            send_telegram(f"🔴 *XAU SELL SIGNAL*\nPrice: {price:.2f}\nRSI: {rsi:.1f} (Overbought)\nVol: {vol_ratio:.2f}x\nTime: {last_update}")
-        
+        # ===== 1. CHECK ACTIVE TRADE FOR TP/SL =====
+        if active_trade:
+            entry = active_trade["entry"]; sl = active_trade["sl"]; tp = active_trade["tp"]; typ = active_trade["type"]
+            if typ == "BUY":
+                if price >= tp:
+                    send_telegram(f"✅ *TP HIT - BUY WIN* 🎯\nEntry: {entry:.2f}\nTP: {tp:.2f}\nNow: {price:.2f}\nProfit: +{price-entry:.2f}\nTime: {last_update}")
+                    active_trade = None
+                elif price <= sl:
+                    send_telegram(f"❌ *SL HIT - BUY LOSS*\nEntry: {entry:.2f}\nSL: {sl:.2f}\nNow: {price:.2f}\nLoss: {price-entry:.2f}\nTime: {last_update}")
+                    active_trade = None
+            else: # SELL
+                if price <= tp:
+                    send_telegram(f"✅ *TP HIT - SELL WIN* 🎯\nEntry: {entry:.2f}\nTP: {tp:.2f}\nNow: {price:.2f}\nProfit: +{entry-price:.2f}\nTime: {last_update}")
+                    active_trade = None
+                elif price >= sl:
+                    send_telegram(f"❌ *SL HIT - SELL LOSS*\nEntry: {entry:.2f}\nSL: {sl:.2f}\nNow: {price:.2f}\nLoss: {entry-price:.2f}\nTime: {last_update}")
+                    active_trade = None
+
+            # If still in trade, log and skip new signals
+            if active_trade:
+                log(f"In TRADE {typ} Entry:{entry:.1f} SL:{sl:.1f} TP:{tp:.1f} Now:{price:.1f} PnL:{price-entry if typ=='BUY' else entry-price:.1f}")
+                time.sleep(SCAN_SECONDS); continue
+
+        # ===== 2. LOOK FOR NEW SIGNAL (only if no active trade) =====
+        candle_time = str(df.index[-1])
+        if candle_time == last_signal_candle:
+            time.sleep(SCAN_SECONDS); continue
+
+        log(f"{price:.1f} RSI:{rsi:.1f} 9:{ma9:.1f} 20:{ma20:.1f} 200:{ma200:.1f} Sup:{support:.1f} Res:{resistance:.1f} Vol:{vol_ratio:.2f}x")
+
+        if price>ma200 and cross_up and near_sup and vol_ratio>=VOL_MULT and rsi<45:
+            sl = support - (price*0.0015)  # SL 0.15% below support
+            risk = price - sl
+            tp = price + (risk*2)  # 1:2 RR
+            active_trade = {"type":"BUY","entry":price,"sl":sl,"tp":tp,"time":last_update}
+            send_telegram(f"🟢 *XAU BUY - FULL CONFLUENCE*\nEntry: {price:.2f}\nSL: {sl:.2f} (-{risk:.2f})\nTP: {tp:.2f} (+{risk*2:.2f})\n✅ Above 200MA\n✅ 9MA crossed ABOVE 20MA\n✅ At SUPPORT {support:.1f}\n✅ RSI {rsi:.1f} Vol {vol_ratio:.2f}x\n*Tracking TP/SL now...*")
+            last_signal_candle = candle_time
+
+        elif price<ma200 and cross_down and near_res and vol_ratio>=VOL_MULT and rsi>55:
+            sl = resistance + (price*0.0015)
+            risk = sl - price
+            tp = price - (risk*2)
+            active_trade = {"type":"SELL","entry":price,"sl":sl,"tp":tp,"time":last_update}
+            send_telegram(f"🔴 *XAU SELL - FULL CONFLUENCE*\nEntry: {price:.2f}\nSL: {sl:.2f} (+{risk:.2f})\nTP: {tp:.2f} (-{risk*2:.2f})\n✅ Below 200MA\n✅ 9MA crossed BELOW 20MA\n✅ At RESISTANCE {resistance:.1f}\n✅ RSI {rsi:.1f} Vol {vol_ratio:.2f}x\n*Tracking TP/SL now...*")
+            last_signal_candle = candle_time
+
         time.sleep(SCAN_SECONDS)
 
 def telegram_loop():
-    log("Telegram listener started")
-    offset = 0
+    offset=0
     while True:
         try:
-            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                             params={"timeout":20,"offset":offset}, timeout=30).json()
+            r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"timeout":20,"offset":offset}, timeout=30).json()
             for upd in r.get("result",[]):
-                offset = upd["update_id"]+1
-                msg = upd.get("message",{}).get("text","")
-                if "/status" in msg:
-                    s = last_state
-                    send_telegram(f"✅ *XAU V3 LIVE*\nPrice: {s['price']}\nRSI: {s['rsi']}\nVol: {s['vol']}x\nStatus: {s['status']}\nLast: {last_update}\nSymbol: {SYMBOL}")
-                if "/checknow" in msg:
-                    send_telegram(f"🔍 Checking now...\nPrice {last_state['price']} RSI {last_state['rsi']} Vol {last_state['vol']}x")
-        except Exception as e:
-            log(f"listener error: {e}")
-            time.sleep(5)
+                offset=upd["update_id"]+1
+                txt=upd.get("message",{}).get("text","")
+                if "/status" in txt:
+                    s=last_state
+                    trade_info = f"\n🎯 ACTIVE: {active_trade['type']} Entry {active_trade['entry']:.1f} SL {active_trade['sl']:.1f} TP {active_trade['tp']:.1f}" if active_trade else "\nNo active trade"
+                    send_telegram(f"✅ *XAU V7 LIVE*\nPrice: {s['price']} RSI: {s['rsi']}\n200MA: {s['ma200']} Vol: {s['vol']}x\nLast: {last_update}{trade_info}")
+                if "/close" in txt:
+                    active_trade=None
+                    send_telegram("Trade tracking cleared")
+        except: time.sleep(5)
 
 app = Flask(__name__)
 @app.route("/")
-def home():
-    return f"XAU V5 OK - Price:{last_state['price']} RSI:{last_state['rsi']} Vol:{last_state['vol']}x Last:{last_update}"
+def home(): return f"V7 OK {last_state['price']} Active:{active_trade['type'] if active_trade else 'None'}"
 
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000, use_reloader=False), daemon=True).start()
 threading.Thread(target=telegram_loop, daemon=True).start()
-
 check_loop()
