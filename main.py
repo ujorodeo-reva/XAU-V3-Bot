@@ -6,7 +6,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = "GC=F"
 RSI_PERIOD = 14
-VOL_MULT = 1.25
+VOL_MULT = 0.10  # <-- FIXED for GC=F: Yahoo volume is always 0.13-0.18x
 SCAN_SECONDS = 60
 
 last_state = {"rsi":0,"vol":0,"price":0,"status":"starting"}
@@ -19,14 +19,14 @@ def rsi_calc(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss.replace(0,0.00001)
+    rs = gain / loss.replace(0, 0.00001)
     return 100 - (100/(1+rs))
 
 def send_telegram(text):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       data={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown"}, timeout=15)
-        log(f"Telegram sent: {text[:60]}")
+        log(f"TG sent: {text[:70]}")
     except Exception as e:
         log(f"TG error: {e}")
 
@@ -34,7 +34,7 @@ def fetch():
     try:
         df = yf.download(SYMBOL, period="2d", interval="15m", progress=False, auto_adjust=True)
         if df.empty or len(df) < 30:
-            log("fetch empty")
+            log("fetch empty, will retry")
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -42,7 +42,12 @@ def fetch():
         df["vol_ma20"] = df["Volume"].rolling(20).mean()
         return df
     except Exception as e:
-        log(f"fetch error: {e}")
+        # This catches the 429 crumb error you saw
+        if "429" in str(e) or "Too Many Requests" in str(e):
+            log(f"Yahoo rate-limited 429, cooling down 120s")
+            time.sleep(120)
+        else:
+            log(f"fetch error: {e}")
         return None
 
 def check_loop():
@@ -52,22 +57,34 @@ def check_loop():
     while True:
         df = fetch()
         if df is None:
-            last_state["status"] = "waiting data"
+            last_state["status"] = "waiting data (yahoo 429)"
             time.sleep(30)
             continue
+            
         last = df.iloc[-1]
-        prev = df.iloc[-2]
         price = float(last["Close"])
         rsi = float(last["rsi"])
         vol = float(last["Volume"])
-        vol_ma = float(last["vol_ma20"])
-        vol_ratio = vol / vol_ma if vol_ma>0 else 0
-        
+        vol_ma = float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0
+
+        # FIX FOR GC=F VOLUME
+        if vol_ma == 0 or vol_ma < 1:
+            vol_ratio = 1.0
+        else:
+            vol_ratio = vol / vol_ma
+        if vol_ratio < 0.05:  # Yahoo bad data
+            vol_ratio = 1.0
+
         last_state = {"rsi":round(rsi,2),"vol":round(vol_ratio,2),"price":round(price,2),"status":"running"}
         last_update = datetime.now().strftime("%H:%M:%S")
         log(f"{price:.2f} RSI:{rsi:.1f} Vol:{vol_ratio:.2f}x")
+
+        # SIGNAL LOGIC
+        if rsi < 30 and vol_ratio >= VOL_MULT:
+            send_telegram(f"🟢 *XAU BUY SIGNAL*\nPrice: {price:.2f}\nRSI: {rsi:.1f} (Oversold)\nVol: {vol_ratio:.2f}x\nTime: {last_update}")
+        elif rsi > 70 and vol_ratio >= VOL_MULT:
+            send_telegram(f"🔴 *XAU SELL SIGNAL*\nPrice: {price:.2f}\nRSI: {rsi:.1f} (Overbought)\nVol: {vol_ratio:.2f}x\nTime: {last_update}")
         
-        # Signal logic here (add your own)
         time.sleep(SCAN_SECONDS)
 
 def telegram_loop():
@@ -82,9 +99,9 @@ def telegram_loop():
                 msg = upd.get("message",{}).get("text","")
                 if "/status" in msg:
                     s = last_state
-                    send_telegram(f"✅ *XAU V3 LIVE*\nPrice: {s['price']}\nRSI: {s['rsi']}\nVol: {s['vol']}x\nStatus: {s['status']}\nLast: {last_update}")
+                    send_telegram(f"✅ *XAU V3 LIVE*\nPrice: {s['price']}\nRSI: {s['rsi']}\nVol: {s['vol']}x\nStatus: {s['status']}\nLast: {last_update}\nSymbol: {SYMBOL}")
                 if "/checknow" in msg:
-                    send_telegram(f"🔍 Checking now...\nPrice {last_state['price']} RSI {last_state['rsi']}")
+                    send_telegram(f"🔍 Checking now...\nPrice {last_state['price']} RSI {last_state['rsi']} Vol {last_state['vol']}x")
         except Exception as e:
             log(f"listener error: {e}")
             time.sleep(5)
@@ -92,11 +109,9 @@ def telegram_loop():
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return f"XAU V3 OK - {last_state} - Last {last_update}"
+    return f"XAU V5 OK - Price:{last_state['price']} RSI:{last_state['rsi']} Vol:{last_state['vol']}x Last:{last_update}"
 
-# START THREADS
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000, use_reloader=False), daemon=True).start()
 threading.Thread(target=telegram_loop, daemon=True).start()
 
-# MAIN LOOP (must be last)
 check_loop()
