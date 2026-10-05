@@ -5,14 +5,29 @@ import time
 import requests
 import os
 from datetime import datetime
+from flask import Flask
+import threading
+
+# --- Flask keep-alive for Render ---
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "XAU V3 5m + S/R Bot LIVE!"
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+threading.Thread(target=run_flask, daemon=True).start()
+# ------------------------------------
 
 SYMBOL = "GC=F"
-TIMEFRAME = "15m"
+TIMEFRAME = "5m"
 SL_PCT = 0.004
 TP_PCT = 0.008
-VOL_MIN = 1.15
-VOL_MAX = 1.65
-MAX_DIST_EMA = 0.01
+VOL_MIN = 1.25 # tighter for 5m
+VOL_MAX = 1.70
+MAX_DIST_EMA = 0.007 # tighter for 5m
+SR_LOOKBACK = 50
+SR_PROXIMITY = 0.005 # 0.5% near S/R
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -24,6 +39,17 @@ def send_telegram(msg):
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+def get_sr_levels(df):
+    """Simple S/R: recent swing highs/lows"""
+    recent = df.tail(SR_LOOKBACK)
+    # Support = lowest low in recent 20, Resistance = highest high
+    support = recent['Low'].rolling(10).min().iloc[-1]
+    # More accurate: use local minima/maxima
+    # Find strongest levels
+    lows = recent.nsmallest(3, 'Low')['Low'].mean()
+    highs = recent.nlargest(3, 'High')['High'].mean()
+    return float(lows), float(highs)
 
 def check_signal():
     df = yf.download(SYMBOL, period="5d", interval=TIMEFRAME, progress=False)
@@ -45,6 +71,9 @@ def check_signal():
     last = df.iloc[-1]
     prev = df.iloc[-2]
     close = float(last['Close'])
+
+    support, resistance = get_sr_levels(df)
+
     ema200 = float(last['EMA200'])
     ema9 = float(last['EMA9'])
     ema20 = float(last['EMA20'])
@@ -60,21 +89,25 @@ def check_signal():
     cross_up = prev['EMA9'] < prev['EMA20'] and last['EMA9'] > last['EMA20']
     cross_down = prev['EMA9'] > prev['EMA20'] and last['EMA9'] < last['EMA20']
 
-    long_cond = close > ema200 and ema_filter and cross_up and (35 < rsi < 68 and rsi_delta > 4) and (macd_line > macd_sig) and vol_filter
-    short_cond = close < ema200 and ema_filter and cross_down and (32 < rsi < 65 and rsi_delta < -4) and (macd_line < macd_sig) and vol_filter
+    # S/R proximity filter
+    near_support = abs(close - support) / close <= SR_PROXIMITY
+    near_resistance = abs(close - resistance) / close <= SR_PROXIMITY
 
-    print(f"[{datetime.now()}] {close:.2f} RSI:{rsi:.1f} Vol:{vol_ratio:.2f}x")
+    long_cond = close > ema200 and ema_filter and cross_up and (35 < rsi < 68 and rsi_delta > 3) and (macd_line > macd_sig) and vol_filter and near_support
+    short_cond = close < ema200 and ema_filter and cross_down and (32 < rsi < 65 and rsi_delta < -3) and (macd_line < macd_sig) and vol_filter and near_resistance
+
+    print(f"[{datetime.now()}] {close:.2f} RSI:{rsi:.1f} Vol:{vol_ratio:.2f}x S:{support:.2f} R:{resistance:.2f} NearSup:{near_support} NearRes:{near_resistance}")
 
     if long_cond:
         sl = close * (1 - SL_PCT); tp = close * (1 + TP_PCT)
-        send_telegram(f"🔼 LONG XAU V3 📈\nPrice: {close:.2f}\nTP: {tp:.2f} (+0.8%)\nSL: {sl:.2f} (-0.4%)\nRR 1:2")
+        send_telegram(f"🔼 LONG XAU V3 5m + S/R 📈\nPrice: {close:.2f}\nSupport: {support:.2f} ✅\nTP: {tp:.2f} (+0.8%)\nSL: {sl:.2f} (-0.4%)\nRR 1:2\nRSI:{rsi:.1f} Vol:{vol_ratio:.2f}x")
 
     if short_cond:
         sl = close * (1 + SL_PCT); tp = close * (1 - TP_PCT)
-        send_telegram(f"🔻 SHORT XAU V3 📉\nPrice: {close:.2f}\nTP: {tp:.2f} (-0.8%)\nSL: {sl:.2f} (+0.4%)\nRR 1:2")
+        send_telegram(f"🔻 SHORT XAU V3 5m + S/R 📉\nPrice: {close:.2f}\nResistance: {resistance:.2f} ✅\nTP: {tp:.2f} (-0.8%)\nSL: {sl:.2f} (+0.4%)\nRR 1:2\nRSI:{rsi:.1f} Vol:{vol_ratio:.2f}x")
 
 print("Bot started...")
-send_telegram("✅ XAU V3 Bot is LIVE on Render!")
+send_telegram("✅ XAU V3 5m + S/R Bot is LIVE on Render!")
 
 while True:
     try:
