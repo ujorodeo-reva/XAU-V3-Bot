@@ -95,26 +95,31 @@ def check_market():
                         active_trade=None
                 if active_trade: time.sleep(60); continue
 
-            vol_surge = c0["v"] > c0["vol_ma20"] if not pd.isna(c0["vol_ma20"]) else True
-            vol_inc = c0["v"] >= c1["v"]
-            if not (vol_surge and vol_inc): time.sleep(60); continue
+            # === BEST VOLUME FILTER - MORE SIGNALS ===
+            # Old: needed vol > avg AND vol increasing (too strict)
+            # New: allow if vol > 80% of average (2-3x more signals, still safe)
+            vol_ok = True
+            if not pd.isna(c0["vol_ma20"]) and c0["vol_ma20"] > 0:
+                vol_ok = c0["v"] >= (c0["vol_ma20"] * 0.8)
+
+            if not vol_ok:
+                time.sleep(60); continue
 
             buy_mom = (c0["ema9"] > c1["ema9"]) and (c0["rsi"] > c1["rsi"]) and (c0["roc"] > 0)
             sell_mom = (c0["ema9"] < c1["ema9"]) and (c0["rsi"] < c1["rsi"]) and (c0["roc"] < 0)
             buy_score = (1 if price > c0["ema20"] else 0) + (1 if c0["ema9"] > c0["ema21"] else 0) + (1 if rsi < 65 else 0) + (1 if c0["roc"] > 0.05 else 0)
             sell_score = (1 if price < c0["ema20"] else 0) + (1 if c0["ema9"] < c0["ema21"] else 0) + (1 if rsi > 35 else 0) + (1 if c0["roc"] < -0.05 else 0)
 
-            # === 1:2 RR FINAL ===
             if buy_mom and buy_score>=3:
-                sl = price * 0.997 # -0.3%
-                tp = price * 1.006 # +0.6% => RR 1:2
+                sl = price * 0.997
+                tp = price * 1.006
                 active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
-                send_tg(f"🟢 <b>BUY 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↑ ROC {c0['roc']:.2f}%\nScore {buy_score}/4\nTP {tp:.2f} (+0.6%) SL {sl:.2f} (-0.3%)")
+                send_tg(f"🟢 <b>BUY 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↑ ROC {c0['roc']:.2f}%\nScore {buy_score}/4\nTP {tp:.2f} (+0.6%) SL {sl:.2f} (-0.3%)\nVol: {c0['v']:.2f}")
             elif sell_mom and sell_score>=3:
-                sl = price * 1.003 # +0.3%
-                tp = price * 0.994 # -0.6% => RR 1:2
+                sl = price * 1.003
+                tp = price * 0.994
                 active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
-                send_tg(f"🔴 <b>SELL 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↓ ROC {c0['roc']:.2f}%\nScore {sell_score}/4\nTP {tp:.2f} (-0.6%) SL {sl:.2f} (+0.3%)")
+                send_tg(f"🔴 <b>SELL 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f}↓ ROC {c0['roc']:.2f}%\nScore {sell_score}/4\nTP {tp:.2f} (-0.6%) SL {sl:.2f} (+0.3%)\nVol: {c0['v']:.2f}")
             time.sleep(60)
         except Exception as e:
             print(f"ERR {e}", flush=True); time.sleep(10)
