@@ -48,12 +48,10 @@ def get_history():
         roc = float(ta.momentum.roc(close, window=9).iloc[-1])
         fut_price = float(close.iloc[-1])
 
-        # Volume check
         vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
         vol_now = float(vol.iloc[-1]) if vol is not None else vol_avg
-        vol_ok = vol_now >= vol_avg*0.85 if vol_avg>0 else True
+        vol_ok = vol_now >= vol_avg*0.70 if vol_avg>0 else True
 
-        # Slope
         ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
         ema9_slope_up = ema9 > ema9_prev
         ema9_slope_down = ema9 < ema9_prev
@@ -72,7 +70,7 @@ def get_data():
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.6 REAL 4/5 STARTED", flush=True)
+    print("MARKET V10.6b BALANCED STARTED", flush=True)
     while True:
         try:
             d = get_data()
@@ -91,54 +89,56 @@ def check_market():
                     elif price>=active_trade["sl"]: send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}"); active_trade=None
                 if active_trade: time.sleep(90); continue
 
-            # ----- NEW REAL 5 FILTERS -----
             dist_200 = abs(price-ema200)/price*100
-            # 1. EMA STACK alignment (ALL)
+
+            # 1. EMA STACK = 1 POINT ONLY (your idea)
             buy_stack = (ema9 > ema20 > ema21 > ema200) and (price > ema9)
             sell_stack = (ema9 < ema20 < ema21 < ema200) and (price < ema9)
-            # 2. RSI Position
-            buy_rsi = 45 < rsi < 65
-            sell_rsi = 35 < rsi < 55
-            rsi_not_extreme = 30 < rsi < 80
-            # 3. Distance from EMA200
-            dist_ok = 0.08 < dist_200 < 1.2
-            # 4. Momentum + Volume
-            buy_mom_vol = (roc > 0.04) and d["vol_ok"] and d["ema9_slope_up"]
-            sell_mom_vol = (roc < -0.04) and d["vol_ok"] and d["ema9_slope_down"]
-            # 5. Trend confirmation
+
+            # 2. RSI Position = 1 POINT
+            buy_rsi = 40 < rsi < 68
+            sell_rsi = 32 < rsi < 58
+            rsi_not_extreme = 28 < rsi < 78
+
+            # 3. Distance from EMA200 = 1 POINT
+            dist_ok = 0.05 < dist_200 < 1.5
+
+            # 4. Momentum + Volume = 1 POINT (tuned to 0.02 and 70% for 1-2 daily)
+            buy_mom_vol = (roc > 0.02) and d["vol_ok"] and d["ema9_slope_up"]
+            sell_mom_vol = (roc < -0.02) and d["vol_ok"] and d["ema9_slope_down"]
+
+            # 5. Trend Confirmation = 1 POINT
             buy_trend = price > ema20
             sell_trend = price < ema20
 
-            # Score BUY
             buy_filters = [
-                ("STACK 9>20>21>200 & price>9" if buy_stack else "STACK FAIL", buy_stack),
-                (f"RSI {rsi:.1f} in 45-65" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi and rsi_not_extreme),
-                (f"Dist EMA200 {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
-                (f"MOM ROC {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL ROC {roc:.3f}%", buy_mom_vol),
-                ("Price > EMA20 trend" if buy_trend else "Trend FAIL", buy_trend)
+                ("STACK 9>20>21>200 & P>9" if buy_stack else "STACK FAIL", buy_stack),
+                (f"RSI {rsi:.1f} in 40-68" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi and rsi_not_extreme),
+                (f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
+                (f"MOM {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", buy_mom_vol),
+                ("Price>EMA20 trend" if buy_trend else "Trend FAIL", buy_trend)
             ]
             sell_filters = [
-                ("STACK 9<20<21<200 & price<9" if sell_stack else "STACK FAIL", sell_stack),
-                (f"RSI {rsi:.1f} in 35-55" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi and rsi_not_extreme),
-                (f"Dist EMA200 {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
-                (f"MOM ROC {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL ROC {roc:.3f}%", sell_mom_vol),
-                ("Price < EMA20 trend" if sell_trend else "Trend FAIL", sell_trend)
+                ("STACK 9<20<21<200 & P<9" if sell_stack else "STACK FAIL", sell_stack),
+                (f"RSI {rsi:.1f} in 32-58" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi and rsi_not_extreme),
+                (f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
+                (f"MOM {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", sell_mom_vol),
+                ("Price<EMA20 trend" if sell_trend else "Trend FAIL", sell_trend)
             ]
 
             buy_score = sum(1 for _,ok in buy_filters if ok)
             sell_score = sum(1 for _,ok in sell_filters if ok)
 
-            # Need 4/5
             if buy_score >=4 and buy_stack:
                 tp=price*1.006; sl=price*0.997
                 active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in buy_filters])
-                send_tg(f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5")
+                send_tg(f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5")
             elif sell_score >=4 and sell_stack:
                 tp=price*0.994; sl=price*1.003
                 active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in sell_filters])
-                send_tg(f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5")
+                send_tg(f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5")
 
             time.sleep(90)
         except Exception as e:
@@ -159,11 +159,11 @@ def telegram_loop():
                     if d: last_price=d["price"]; last_rsi=d["rsi"]; last_check=time.strftime("%H:%M:%S")
                     tr="No trade"
                     if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f} TP:{active_trade['tp']:.2f} SL:{active_trade['sl']:.2f}"
-                    send_tg(f"✅ <b>V10.6 REAL 4/5 LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
+                    send_tg(f"✅ <b>V10.6b BALANCED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.6 {last_price} {last_check}"
+def home(): return f"V10.6b {last_price} {last_check}"
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
 if __name__ == "__main__":
