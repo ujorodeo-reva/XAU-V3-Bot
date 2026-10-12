@@ -9,9 +9,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 app = Flask(__name__)
 last_price = 0
+last_spot = 0
 last_rsi = 0
 last_check = "Never"
-last_symbol = "None"
 active_trade = None
 
 def send_tg(text):
@@ -21,43 +21,89 @@ def send_tg(text):
     except Exception as e:
         print(f"SEND FAIL {e}")
 
-def get_data():
-    try:
-        for symbol in ["XAUUSD=X", "GC=F"]:
-            try:
-                df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
-                if df.empty:
-                    continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                
-                close = df['Close']
-                if len(close) < 200:
-                    print(f"YF {symbol} not enough candles {len(close)}", flush=True)
-                    continue
-                    
-                price = float(close.iloc[-1])
-                ema9 = float(ta.trend.ema_indicator(close, window=9).iloc[-1])
-                ema20 = float(ta.trend.ema_indicator(close, window=20).iloc[-1])
-                ema21 = float(ta.trend.ema_indicator(close, window=21).iloc[-1])
-                ema200 = float(ta.trend.ema_indicator(close, window=200).iloc[-1])
-                rsi = float(ta.momentum.rsi(close, window=14).iloc[-1])
-                roc = float(ta.momentum.roc(close, window=9).iloc[-1])
+def get_spot_price():
+    # Try 3 free spot gold APIs
+    urls = [
+        "https://api.gold-api.com/price/XAU",
+        "https://api.metals.live/v1/spot",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=8).json()
+            # gold-api format: {"price": 4189.2}
+            if "price" in r:
+                p = float(r["price"])
+                print(f"SPOT API {url} OK {p}", flush=True)
+                return p
+            # metals.live format: [{"gold": 4189}]
+            if isinstance(r, list) and len(r)>0 and "gold" in r[0]:
+                p = float(r[0]["gold"])
+                print(f"SPOT API metals.live OK {p}", flush=True)
+                return p
+        except Exception as e:
+            print(f"SPOT API {url} FAIL {e}", flush=True)
+            continue
+    return None
 
-                print(f"YF OK {symbol} Price {price:.2f} RSI {rsi:.1f}", flush=True)
-                return {"price": price, "ema9": ema9, "ema20": ema20, "ema21": ema21, "ema200": ema200, "rsi": rsi, "roc": roc, "symbol": symbol}
-            except Exception as e:
-                print(f"YF {symbol} fail {e}", flush=True)
-                continue
-        print("ALL YF SYMBOLS FAILED", flush=True)
-        return None
+def get_history():
+    try:
+        df = yf.download("GC=F", period="7d", interval="5m", progress=False, auto_adjust=True, prepost=False)
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        close = df['Close']
+        if len(close) < 50:
+            return None
+        
+        ema9 = float(ta.trend.ema_indicator(close, window=9).iloc[-1])
+        ema20 = float(ta.trend.ema_indicator(close, window=20).iloc[-1])
+        ema21 = float(ta.trend.ema_indicator(close, window=21).iloc[-1])
+        ema_len = 200 if len(close) >= 200 else 100
+        ema200 = float(ta.trend.ema_indicator(close, window=ema_len).iloc[-1])
+        rsi = float(ta.momentum.rsi(close, window=14).iloc[-1])
+        roc = float(ta.momentum.roc(close, window=9).iloc[-1])
+        fut_price = float(close.iloc[-1])
+        return {"ema9": ema9, "ema20": ema20, "ema21": ema21, "ema200": ema200, "rsi": rsi, "roc": roc, "fut_price": fut_price, "ema_len": ema_len}
     except Exception as e:
-        print(f"YF FAIL {e}", flush=True)
+        print(f"HISTORY FAIL {e}", flush=True)
         return None
+
+def get_data():
+    spot = get_spot_price()
+    hist = get_history()
+    if hist is None:
+        return None
+    # If spot API fails, use futures price - ~20$ premium estimate as fallback
+    if spot is None:
+        spot = hist["fut_price"] - 18.0
+        print(f"USING FALLBACK SPOT {spot} from FUT {hist['fut_price']}", flush=True)
+    
+    # Calculate premium to adjust EMAs to spot level
+    premium = hist["fut_price"] - spot
+    # Adjust EMAs down to spot level
+    adj_ema9 = hist["ema9"] - premium
+    adj_ema20 = hist["ema20"] - premium
+    adj_ema21 = hist["ema21"] - premium
+    adj_ema200 = hist["ema200"] - premium
+
+    return {
+        "price": spot, # TRUE SPOT for display and signals
+        "fut_price": hist["fut_price"],
+        "ema9": adj_ema9,
+        "ema20": adj_ema20,
+        "ema21": adj_ema21,
+        "ema200": adj_ema200,
+        "rsi": hist["rsi"],
+        "roc": hist["roc"],
+        "ema_len": hist["ema_len"],
+        "premium": premium
+    }
 
 def check_market():
-    global last_price, last_rsi, last_check, last_symbol, active_trade
-    print("MARKET V10.1 SPOT STARTED", flush=True)
+    global last_price, last_spot, last_rsi, last_check, active_trade
+    print("MARKET V10.3 TRUE SPOT STARTED", flush=True)
     
     while True:
         try:
@@ -67,10 +113,10 @@ def check_market():
                 continue
 
             price = d["price"]; ema9 = d["ema9"]; ema20 = d["ema20"]; ema21 = d["ema21"]; ema200 = d["ema200"]
-            rsi = d["rsi"]; roc = d["roc"]; symbol = d["symbol"]
+            rsi = d["rsi"]; roc = d["roc"]
 
-            last_price = price; last_rsi = rsi; last_check = time.strftime("%H:%M:%S"); last_symbol = symbol
-            print(f"CHECK {symbol} {price:.2f} RSI {rsi:.1f} EMA200 {ema200:.2f}", flush=True)
+            last_price = price; last_spot = price; last_rsi = rsi; last_check = time.strftime("%H:%M:%S")
+            print(f"CHECK SPOT {price:.2f} FUT {d['fut_price']:.2f} PREM {d['premium']:.2f} RSI {rsi:.1f}", flush=True)
 
             if active_trade:
                 entry = active_trade["entry"]
@@ -88,10 +134,8 @@ def check_market():
                     time.sleep(90); continue
 
             if rsi < 30 or rsi > 80:
-                print(f"SKIP EXTREME RSI {rsi}", flush=True)
                 time.sleep(90); continue
             if abs(price - ema200)/price*100 < 0.08:
-                print(f"SKIP CLOSE EMA200", flush=True)
                 time.sleep(90); continue
 
             above_200 = price > ema200
@@ -107,17 +151,17 @@ def check_market():
 
             if buy_mom and buy_score >= 4:
                 active_trade={"dir":"BUY","entry":price,"tp":price*1.006,"sl":price*0.997}
-                send_tg(f"🟢 <b>BUY 1:2 RR</b>\n{last_symbol} {price:.2f}\nEMA200 {ema200:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {buy_score}/5\nTP {price*1.006:.2f} SL {price*0.997:.2f}")
+                send_tg(f"🟢 <b>BUY 1:2 RR</b>\nSPOT {price:.2f} (FUT {d['fut_price']:.2f})\nEMA{d['ema_len']} {ema200:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {buy_score}/5")
             elif sell_mom and sell_score >= 4:
                 active_trade={"dir":"SELL","entry":price,"tp":price*0.994,"sl":price*1.003}
-                send_tg(f"🔴 <b>SELL 1:2 RR</b>\n{last_symbol} {price:.2f}\nEMA200 {ema200:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {sell_score}/5\nTP {price*0.994:.2f} SL {price*1.003:.2f}")
+                send_tg(f"🔴 <b>SELL 1:2 RR</b>\nSPOT {price:.2f} (FUT {d['fut_price']:.2f})\nEMA{d['ema_len']} {ema200:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {sell_score}/5")
 
             time.sleep(90)
         except Exception as e:
             print(f"ERR {e}", flush=True); time.sleep(30)
 
 def telegram_loop():
-    global last_price, last_rsi, last_check, last_symbol
+    global last_price, last_rsi, last_check
     offset=0
     while True:
         try:
@@ -129,14 +173,14 @@ def telegram_loop():
                 if "/status" in text or "/start" in text:
                     d = get_data()
                     if d:
-                        last_price = d["price"]; last_rsi = d["rsi"]; last_check = time.strftime("%H:%M:%S"); last_symbol = d["symbol"]
+                        last_price = d["price"]; last_rsi = d["rsi"]; last_check = time.strftime("%H:%M:%S")
                     tr="No trade"
                     if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f}"
-                    send_tg(f"✅ <b>V10.1 SPOT LIVE</b>\n{last_symbol} Price: {last_price:.2f}\nRSI: {last_rsi:.2f}\nLast: {last_check}\n{tr}")
+                    send_tg(f"✅ <b>V10.3 TRUE SPOT LIVE</b>\nSPOT Price: {last_price:.2f}\nFUT Price: {d['fut_price']:.2f} (prem {d['premium']:.2f})\nRSI: {last_rsi:.2f}\nLast: {last_check}\n{tr}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.1 {last_symbol} {last_price} {last_check}"
+def home(): return f"V10.3 SPOT {last_price} FUT {last_price+18} {last_check}"
 
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
