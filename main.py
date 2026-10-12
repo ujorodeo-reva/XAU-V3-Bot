@@ -19,35 +19,49 @@ def send_tg(text):
         print(f"SEND FAIL {e}")
 
 def get_tv_data():
-    try:
-        handler = TA_Handler(
-            symbol="XAUUSD",
-            screener="forex",
-            exchange="OANDA",
-            interval=Interval.INTERVAL_5_MINUTES
-        )
-        a = handler.get_analysis()
-        print(f"TV RAW: {a.indicators}", flush=True)
-        return a.indicators
-    except Exception as e:
-        print(f"TV FAIL {e}", flush=True)
-        return None
+    tries = [
+        ("XAUUSD", "OANDA", "forex"),
+        ("XAUUSD", "FOREXCOM", "forex"),
+        ("GOLD", "OANDA", "cfd"),
+    ]
+    for sym, exch, scr in tries:
+        try:
+            handler = TA_Handler(
+                symbol=sym,
+                screener=scr,
+                exchange=exch,
+                interval=Interval.INTERVAL_5_MINUTES
+            )
+            a = handler.get_analysis()
+            close_price = a.indicators.get("close")
+            if close_price:
+                print(f"TV OK {sym}/{exch} {close_price}", flush=True)
+                return a.indicators
+        except Exception as e:
+            print(f"TV TRY {sym}/{exch} FAIL {e}", flush=True)
+            time.sleep(2)
+            continue
+    print("ALL TV TRIES FAILED", flush=True)
+    return None
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET CHECK THREAD STARTED V9.2", flush=True)
-    # instant try
+    print("MARKET CHECK V9.3 STARTED", flush=True)
+
+    # first fetch immediately
     ind = get_tv_data()
     if ind:
         last_price = float(ind["close"])
         last_rsi = float(ind.get("RSI", 0))
         last_check = time.strftime("%H:%M:%S")
-    
+
     while True:
         try:
             ind = get_tv_data()
             if ind is None:
-                time.sleep(30); continue
+                print("NO DATA - sleep 90s", flush=True)
+                time.sleep(90)
+                continue
 
             price = float(ind["close"])
             ema9 = float(ind.get("EMA9", ind.get("EMA10", price)))
@@ -57,29 +71,43 @@ def check_market():
             rsi = float(ind.get("RSI", 50))
             roc = float(ind.get("ROC", 0))
 
-            last_price = price; last_rsi = rsi; last_check = time.strftime("%H:%M:%S")
-            print(f"CHECK {price:.2f} RSI {rsi:.1f}", flush=True)
+            last_price = price
+            last_rsi = rsi
+            last_check = time.strftime("%H:%M:%S")
+            print(f"CHECK {price:.2f} RSI {rsi:.1f} EMA200 {ema200:.2f}", flush=True)
 
             if active_trade:
                 entry = active_trade["entry"]
                 if active_trade["dir"] == "BUY":
                     if price >= active_trade["tp"]:
                         send_tg(f"✅ <b>TP HIT BUY</b>\n{entry:.2f} -> {price:.2f}")
-                        active_trade=None
+                        active_trade = None
                     elif price <= active_trade["sl"]:
-                        send_tg(f"❌ <b>SL HIT BUY</b>"); active_trade=None
+                        send_tg(f"❌ <b>SL HIT BUY</b>\n{entry:.2f} -> {price:.2f}")
+                        active_trade = None
                 else:
                     if price <= active_trade["tp"]:
                         send_tg(f"✅ <b>TP HIT SELL</b>\n{entry:.2f} -> {price:.2f}")
-                        active_trade=None
+                        active_trade = None
                     elif price >= active_trade["sl"]:
-                        send_tg(f"❌ <b>SL HIT SELL</b>"); active_trade=None
-                if active_trade: time.sleep(60); continue
+                        send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}")
+                        active_trade = None
+                if active_trade:
+                    time.sleep(90)
+                    continue
 
-            if rsi < 30 or rsi > 80: time.sleep(60); continue
-            if abs(price - ema200)/price*100 < 0.08: time.sleep(60); continue
+            if rsi < 30 or rsi > 80:
+                print(f"SKIP EXTREME RSI {rsi}", flush=True)
+                time.sleep(90)
+                continue
 
-            above_200 = price > ema200; below_200 = price < ema200
+            if abs(price - ema200) / price * 100 < 0.08:
+                print(f"SKIP CLOSE EMA200", flush=True)
+                time.sleep(90)
+                continue
+
+            above_200 = price > ema200
+            below_200 = price < ema200
             buy_rsi_ok = 45 < rsi < 68
             sell_rsi_ok = 33 < rsi < 55
 
@@ -89,41 +117,48 @@ def check_market():
             buy_score = (1 if price > ema20 else 0) + (1 if ema9 > ema21 else 0) + (1 if buy_rsi_ok else 0) + (1 if roc > 0.05 else 0) + (1 if above_200 else 0)
             sell_score = (1 if price < ema20 else 0) + (1 if ema9 < ema21 else 0) + (1 if sell_rsi_ok else 0) + (1 if roc < -0.05 else 0) + (1 if below_200 else 0)
 
-            if buy_mom and buy_score>=4:
-                active_trade={"dir":"BUY","entry":price,"tp":price*1.006,"sl":price*0.997}
-                send_tg(f"🟢 <b>BUY</b>\n{price:.2f} RSI {rsi:.1f} Score {buy_score}/5")
-            elif sell_mom and sell_score>=4:
-                active_trade={"dir":"SELL","entry":price,"tp":price*0.994,"sl":price*1.003}
-                send_tg(f"🔴 <b>SELL</b>\n{price:.2f} RSI {rsi:.1f} Score {sell_score}/5")
+            if buy_mom and buy_score >= 4:
+                active_trade = {"dir": "BUY", "entry": price, "tp": price*1.006, "sl": price*0.997}
+                send_tg(f"🟢 <b>BUY 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {buy_score}/5\nTP {price*1.006:.2f} SL {price*0.997:.2f}")
+            elif sell_mom and sell_score >= 4:
+                active_trade = {"dir": "SELL", "entry": price, "tp": price*0.994, "sl": price*1.003}
+                send_tg(f"🔴 <b>SELL 1:2 RR</b>\nPrice {price:.2f}\nRSI {rsi:.1f} ROC {roc:.2f}%\nScore {sell_score}/5\nTP {price*0.994:.2f} SL {price*1.003:.2f}")
 
-            time.sleep(60)
+            time.sleep(90)
+
         except Exception as e:
-            print(f"ERR {e}", flush=True); time.sleep(10)
+            print(f"ERR {e}", flush=True)
+            time.sleep(30)
 
 def telegram_loop():
     global last_price, last_rsi, last_check
-    offset=0
+    offset = 0
     while True:
         try:
-            r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset":offset,"timeout":25}, timeout=30).json()
+            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset": offset, "timeout": 25}, timeout=30).json()
             for upd in r.get("result", []):
-                offset=upd["update_id"]+1
-                msg=upd.get("message",{}); text=msg.get("text",""); chat=str(msg.get("chat",{}).get("id",""))
-                if chat!=CHAT_ID: continue
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                text = msg.get("text", "")
+                chat = str(msg.get("chat", {}).get("id", ""))
+                if chat != CHAT_ID:
+                    continue
                 if "/status" in text or "/start" in text:
-                    # FORCE FETCH ON COMMAND
                     ind = get_tv_data()
                     if ind:
                         last_price = float(ind["close"])
                         last_rsi = float(ind.get("RSI", 0))
                         last_check = time.strftime("%H:%M:%S")
-                    tr="No trade"
-                    if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f}"
-                    send_tg(f"✅ <b>V9.2 TV OANDA LIVE</b>\nPrice: {last_price:.2f}\nRSI: {last_rsi:.2f}\nLast: {last_check}\n{tr}")
-        except: time.sleep(3)
+                    tr = "No trade"
+                    if active_trade:
+                        tr = f"{active_trade['dir']} E:{active_trade['entry']:.2f}"
+                    send_tg(f"✅ <b>V9.3 TV LIVE</b>\nPrice: {last_price:.2f}\nRSI: {last_rsi:.2f}\nLast: {last_check}\n{tr}")
+        except:
+            time.sleep(3)
 
 @app.route("/")
-def home(): return f"V9.2 {last_price} {last_check}"
+def home():
+    return f"V9.3 LIVE {last_price} {last_check}"
 
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
