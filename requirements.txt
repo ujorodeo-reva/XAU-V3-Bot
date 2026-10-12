@@ -1,3 +1,4 @@
+tradingview-ta
+flask
 pandas
 requests
-flask
