@@ -1,3 +1,5 @@
-tradingview-ta==3.3.0
 flask
 requests
+yfinance
+ta
+pandas
