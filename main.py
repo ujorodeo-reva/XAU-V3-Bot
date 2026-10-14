@@ -14,11 +14,16 @@ last_check = "Never"
 active_trade = None
 
 def send_tg(text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        print(f"SEND FAIL {e}")
+    for attempt in range(3):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=12)
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"SEND FAIL try {attempt+1} {e}", flush=True)
+        time.sleep(2)
+    return False
 
 def get_spot_price():
     urls = ["https://api.gold-api.com/price/XAU","https://api.metals.live/v1/spot"]
@@ -70,7 +75,7 @@ def get_data():
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.6b BALANCED STARTED", flush=True)
+    print("MARKET V10.6c FIXED STARTED", flush=True)
     while True:
         try:
             d = get_data()
@@ -82,32 +87,31 @@ def check_market():
             if active_trade:
                 entry=active_trade["entry"]
                 if active_trade["dir"]=="BUY":
-                    if price>=active_trade["tp"]: send_tg(f"✅ <b>TP HIT BUY</b>\n{entry:.2f} -> {price:.2f}"); active_trade=None
-                    elif price<=active_trade["sl"]: send_tg(f"❌ <b>SL HIT BUY</b>\n{entry:.2f} -> {price:.2f}"); active_trade=None
+                    if price>=active_trade["tp"]:
+                        if send_tg(f"✅ <b>TP HIT BUY</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
+                    elif price<=active_trade["sl"]:
+                        if send_tg(f"❌ <b>SL HIT BUY</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                 else:
-                    if price<=active_trade["tp"]: send_tg(f"✅ <b>TP HIT SELL</b>\n{entry:.2f} -> {price:.2f}"); active_trade=None
-                    elif price>=active_trade["sl"]: send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}"); active_trade=None
+                    if price<=active_trade["tp"]:
+                        if send_tg(f"✅ <b>TP HIT SELL</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
+                    elif price>=active_trade["sl"]:
+                        if send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                 if active_trade: time.sleep(90); continue
 
             dist_200 = abs(price-ema200)/price*100
 
-            # 1. EMA STACK = 1 POINT ONLY (your idea)
             buy_stack = (ema9 > ema20 > ema21 > ema200) and (price > ema9)
             sell_stack = (ema9 < ema20 < ema21 < ema200) and (price < ema9)
 
-            # 2. RSI Position = 1 POINT
             buy_rsi = 40 < rsi < 68
             sell_rsi = 32 < rsi < 58
             rsi_not_extreme = 28 < rsi < 78
 
-            # 3. Distance from EMA200 = 1 POINT
             dist_ok = 0.05 < dist_200 < 1.5
 
-            # 4. Momentum + Volume = 1 POINT (tuned to 0.02 and 70% for 1-2 daily)
             buy_mom_vol = (roc > 0.02) and d["vol_ok"] and d["ema9_slope_up"]
             sell_mom_vol = (roc < -0.02) and d["vol_ok"] and d["ema9_slope_down"]
 
-            # 5. Trend Confirmation = 1 POINT
             buy_trend = price > ema20
             sell_trend = price < ema20
 
@@ -131,14 +135,18 @@ def check_market():
 
             if buy_score >=4 and buy_stack:
                 tp=price*1.006; sl=price*0.997
-                active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in buy_filters])
-                send_tg(f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5")
+                msg = f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5"
+                if send_tg(msg):
+                    active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
+                    print(f"BUY OPENED {price}", flush=True)
             elif sell_score >=4 and sell_stack:
                 tp=price*0.994; sl=price*1.003
-                active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in sell_filters])
-                send_tg(f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5")
+                msg = f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5"
+                if send_tg(msg):
+                    active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
+                    print(f"SELL OPENED {price}", flush=True)
 
             time.sleep(90)
         except Exception as e:
@@ -159,11 +167,11 @@ def telegram_loop():
                     if d: last_price=d["price"]; last_rsi=d["rsi"]; last_check=time.strftime("%H:%M:%S")
                     tr="No trade"
                     if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f} TP:{active_trade['tp']:.2f} SL:{active_trade['sl']:.2f}"
-                    send_tg(f"✅ <b>V10.6b BALANCED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
+                    send_tg(f"✅ <b>V10.6c FIXED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.6b {last_price} {last_check}"
+def home(): return f"V10.6c {last_price} {last_check}"
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
 if __name__ == "__main__":
