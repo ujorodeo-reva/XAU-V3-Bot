@@ -1,4 +1,4 @@
-import os, time, threading, requests
+import os, time, threading, requests, random
 from flask import Flask
 import yfinance as yf
 import pandas as pd
@@ -21,7 +21,7 @@ def send_tg(text):
             if r.status_code == 200:
                 return True
         except Exception as e:
-            print(f"SEND FAIL try {attempt+1} {e}", flush=True)
+            print(f"SEND FAIL {e}", flush=True)
         time.sleep(2)
     return False
 
@@ -36,35 +36,39 @@ def get_spot_price():
     return None
 
 def get_history():
-    try:
-        df = yf.download("GC=F", period="7d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
-        close = df['Close']
-        vol = df['Volume'] if 'Volume' in df.columns else None
-        if len(close) < 100: return None
+    # V10.8 FIX: anti-429 with retries and backoff
+    for retry in range(3):
+        try:
+            time.sleep(random.uniform(1,3)) # jitter to avoid 429
+            df = yf.download("GC=F", period="7d", interval="5m", progress=False, auto_adjust=True, threads=False)
+            if df.empty: raise Exception("empty df")
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            close = df['Close']
+            vol = df['Volume'] if 'Volume' in df.columns else None
+            if len(close) < 100: return None
 
-        ema9 = float(ta.trend.ema_indicator(close, window=9).iloc[-1])
-        ema20 = float(ta.trend.ema_indicator(close, window=20).iloc[-1])
-        ema21 = float(ta.trend.ema_indicator(close, window=21).iloc[-1])
-        ema200 = float(ta.trend.ema_indicator(close, window=200).iloc[-1] if len(close)>=200 else ta.trend.ema_indicator(close, window=100).iloc[-1])
-        rsi = float(ta.momentum.rsi(close, window=14).iloc[-1])
-        roc = float(ta.momentum.roc(close, window=9).iloc[-1])
-        fut_price = float(close.iloc[-1])
+            ema9 = float(ta.trend.ema_indicator(close, window=9).iloc[-1])
+            ema20 = float(ta.trend.ema_indicator(close, window=20).iloc[-1])
+            ema21 = float(ta.trend.ema_indicator(close, window=21).iloc[-1])
+            ema200 = float(ta.trend.ema_indicator(close, window=200).iloc[-1] if len(close)>=200 else ta.trend.ema_indicator(close, window=100).iloc[-1])
+            rsi = float(ta.momentum.rsi(close, window=14).iloc[-1])
+            roc = float(ta.momentum.roc(close, window=9).iloc[-1])
+            fut_price = float(close.iloc[-1])
 
-        vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
-        vol_now = float(vol.iloc[-1]) if vol is not None else vol_avg
-        # V10.7 FIX: 0.50 instead of 0.70
-        vol_ok = vol_now >= vol_avg*0.50 if vol_avg>0 else True
+            vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
+            vol_now = float(vol.iloc[-1]) if vol is not None else vol_avg
+            vol_ok = vol_now >= vol_avg*0.40 if vol_avg>0 else True # V10.8: 40%
 
-        ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
-        ema9_slope_up = ema9 > ema9_prev
-        ema9_slope_down = ema9 < ema9_prev
-
-        return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"vol_now":vol_now,"vol_avg":vol_avg,"ema9_slope_up":ema9_slope_up,"ema9_slope_down":ema9_slope_down}
-    except Exception as e:
-        print(f"HISTORY FAIL {e}", flush=True); return None
+            ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
+            return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"vol_now":vol_now,"vol_avg":vol_avg,"ema9_slope_up":ema9>ema9_prev,"ema9_slope_down":ema9<ema9_prev}
+        except Exception as e:
+            print(f"HISTORY FAIL retry {retry} {e}", flush=True)
+            if "429" in str(e) or "crumb" in str(e).lower():
+                time.sleep(60 + retry*30) # long backoff for 429
+            else:
+                time.sleep(10)
+    return None
 
 def get_data():
     spot = get_spot_price()
@@ -72,18 +76,18 @@ def get_data():
     if hist is None: return None
     if spot is None: spot = hist["fut_price"] - 18.0
     premium = hist["fut_price"] - spot
-    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"vol_now":hist["vol_now"],"vol_avg":hist["vol_avg"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"],"premium":premium}
+    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"vol_now":hist["vol_now"],"vol_avg":hist["vol_avg"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"]}
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.7 LOW-VOL FIX STARTED", flush=True)
+    print("MARKET V10.8 ANTI-429 STARTED", flush=True)
     while True:
         try:
             d = get_data()
-            if d is None: time.sleep(60); continue
+            if d is None: print("NO DATA, sleep 120s", flush=True); time.sleep(120); continue
             price = d["price"]; ema9=d["ema9"]; ema20=d["ema20"]; ema21=d["ema21"]; ema200=d["ema200"]; rsi=d["rsi"]; roc=d["roc"]
             last_price=price; last_rsi=rsi; last_check=time.strftime("%H:%M:%S")
-            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.3f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']}", flush=True)
+            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']}", flush=True)
 
             if active_trade:
                 entry=active_trade["entry"]
@@ -100,37 +104,23 @@ def check_market():
                 if active_trade: time.sleep(90); continue
 
             dist_200 = abs(price-ema200)/price*100
-
             buy_stack = (ema9 > ema20 > ema21 > ema200) and (price > ema9)
             sell_stack = (ema9 < ema20 < ema21 < ema200) and (price < ema9)
-
             buy_rsi = 40 < rsi < 68
             sell_rsi = 32 < rsi < 58
-            rsi_not_extreme = 28 < rsi < 78
-
             dist_ok = 0.05 < dist_200 < 1.5
+            # V10.8: flat market protection - if ROC <0.005, skip
+            if abs(roc) < 0.005:
+                print("FLAT MARKET, skip", flush=True)
+                time.sleep(90); continue
 
-            # V10.7 FIX: ROC 0.01 and VOL logic relaxed
             buy_mom_vol = (roc > 0.01) and (d["vol_ok"] or roc > 0.03) and d["ema9_slope_up"]
             sell_mom_vol = (roc < -0.01) and (d["vol_ok"] or roc < -0.03) and d["ema9_slope_down"]
-
             buy_trend = price > ema20
             sell_trend = price < ema20
 
-            buy_filters = [
-                ("STACK 9>20>21>200 & P>9" if buy_stack else "STACK FAIL", buy_stack),
-                (f"RSI {rsi:.1f} in 40-68" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi and rsi_not_extreme),
-                (f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
-                (f"MOM {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", buy_mom_vol),
-                ("Price>EMA20 trend" if buy_trend else "Trend FAIL", buy_trend)
-            ]
-            sell_filters = [
-                ("STACK 9<20<21<200 & P<9" if sell_stack else "STACK FAIL", sell_stack),
-                (f"RSI {rsi:.1f} in 32-58" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi and rsi_not_extreme),
-                (f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),
-                (f"MOM {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", sell_mom_vol),
-                ("Price<EMA20 trend" if sell_trend else "Trend FAIL", sell_trend)
-            ]
+            buy_filters = [("STACK 9>20>21>200 & P>9" if buy_stack else "STACK FAIL", buy_stack),(f"RSI {rsi:.1f} in 40-68" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", buy_mom_vol),("Price>EMA20" if buy_trend else "Trend FAIL", buy_trend)]
+            sell_filters = [("STACK 9<20<21<200 & P<9" if sell_stack else "STACK FAIL", sell_stack),(f"RSI {rsi:.1f} in 32-58" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", sell_mom_vol),("Price<EMA20" if sell_trend else "Trend FAIL", sell_trend)]
 
             buy_score = sum(1 for _,ok in buy_filters if ok)
             sell_score = sum(1 for _,ok in sell_filters if ok)
@@ -139,20 +129,16 @@ def check_market():
                 tp=price*1.006; sl=price*0.997
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in buy_filters])
                 msg = f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5"
-                if send_tg(msg):
-                    active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
-                    print(f"BUY OPENED {price}", flush=True)
+                if send_tg(msg): active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
             elif sell_score >=4 and sell_stack:
                 tp=price*0.994; sl=price*1.003
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in sell_filters])
                 msg = f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5"
-                if send_tg(msg):
-                    active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
-                    print(f"SELL OPENED {price}", flush=True)
+                if send_tg(msg): active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
 
-            time.sleep(90)
+            time.sleep(120) # V10.8: 120s not 90s to avoid 429
         except Exception as e:
-            print(f"ERR {e}", flush=True); time.sleep(30)
+            print(f"ERR {e}", flush=True); time.sleep(60)
 
 def telegram_loop():
     global last_price, last_rsi, last_check
@@ -166,14 +152,13 @@ def telegram_loop():
                 if chat!=CHAT_ID: continue
                 if "/status" in text or "/start" in text:
                     d=get_data()
-                    if d: last_price=d["price"]; last_rsi=d["rsi"]; last_check=time.strftime("%H:%M:%S")
-                    tr="No trade"
-                    if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f} TP:{active_trade['tp']:.2f} SL:{active_trade['sl']:.2f}"
-                    send_tg(f"✅ <b>V10.7 FIXED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
+                    if d: last_price=d["price"]; last_rsi=d["rsi"]
+                    tr="No trade" if not active_trade else f"{active_trade['dir']} E:{active_trade['entry']:.2f}"
+                    send_tg(f"✅ <b>V10.8 LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\n{tr}\nLast {last_check}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.7 {last_price} {last_check}"
+def home(): return f"V10.8 {last_price} {last_check}"
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
 if __name__ == "__main__":
