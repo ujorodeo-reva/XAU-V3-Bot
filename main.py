@@ -55,13 +55,14 @@ def get_history():
 
         vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
         vol_now = float(vol.iloc[-1]) if vol is not None else vol_avg
-        vol_ok = vol_now >= vol_avg*0.70 if vol_avg>0 else True
+        # V10.7 FIX: 0.50 instead of 0.70
+        vol_ok = vol_now >= vol_avg*0.50 if vol_avg>0 else True
 
         ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
         ema9_slope_up = ema9 > ema9_prev
         ema9_slope_down = ema9 < ema9_prev
 
-        return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"ema9_slope_up":ema9_slope_up,"ema9_slope_down":ema9_slope_down}
+        return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"vol_now":vol_now,"vol_avg":vol_avg,"ema9_slope_up":ema9_slope_up,"ema9_slope_down":ema9_slope_down}
     except Exception as e:
         print(f"HISTORY FAIL {e}", flush=True); return None
 
@@ -71,18 +72,18 @@ def get_data():
     if hist is None: return None
     if spot is None: spot = hist["fut_price"] - 18.0
     premium = hist["fut_price"] - spot
-    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"],"premium":premium}
+    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"vol_now":hist["vol_now"],"vol_avg":hist["vol_avg"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"],"premium":premium}
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.6c FIXED STARTED", flush=True)
+    print("MARKET V10.7 LOW-VOL FIX STARTED", flush=True)
     while True:
         try:
             d = get_data()
             if d is None: time.sleep(60); continue
             price = d["price"]; ema9=d["ema9"]; ema20=d["ema20"]; ema21=d["ema21"]; ema200=d["ema200"]; rsi=d["rsi"]; roc=d["roc"]
             last_price=price; last_rsi=rsi; last_check=time.strftime("%H:%M:%S")
-            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.3f} VOL_OK {d['vol_ok']}", flush=True)
+            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.3f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']}", flush=True)
 
             if active_trade:
                 entry=active_trade["entry"]
@@ -109,8 +110,9 @@ def check_market():
 
             dist_ok = 0.05 < dist_200 < 1.5
 
-            buy_mom_vol = (roc > 0.02) and d["vol_ok"] and d["ema9_slope_up"]
-            sell_mom_vol = (roc < -0.02) and d["vol_ok"] and d["ema9_slope_down"]
+            # V10.7 FIX: ROC 0.01 and VOL logic relaxed
+            buy_mom_vol = (roc > 0.01) and (d["vol_ok"] or roc > 0.03) and d["ema9_slope_up"]
+            sell_mom_vol = (roc < -0.01) and (d["vol_ok"] or roc < -0.03) and d["ema9_slope_down"]
 
             buy_trend = price > ema20
             sell_trend = price < ema20
@@ -167,11 +169,11 @@ def telegram_loop():
                     if d: last_price=d["price"]; last_rsi=d["rsi"]; last_check=time.strftime("%H:%M:%S")
                     tr="No trade"
                     if active_trade: tr=f"{active_trade['dir']} E:{active_trade['entry']:.2f} TP:{active_trade['tp']:.2f} SL:{active_trade['sl']:.2f}"
-                    send_tg(f"✅ <b>V10.6c FIXED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
+                    send_tg(f"✅ <b>V10.7 FIXED LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\nLast {last_check}\n{tr}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.6c {last_price} {last_check}"
+def home(): return f"V10.7 {last_price} {last_check}"
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
 if __name__ == "__main__":
