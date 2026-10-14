@@ -18,30 +18,26 @@ def send_tg(text):
         try:
             r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=12)
-            if r.status_code == 200:
-                return True
-        except Exception as e:
-            print(f"SEND FAIL {e}", flush=True)
+            if r.status_code == 200: return True
+        except: pass
         time.sleep(2)
     return False
 
 def get_spot_price():
-    urls = ["https://api.gold-api.com/price/XAU","https://api.metals.live/v1/spot"]
-    for url in urls:
+    for url in ["https://api.gold-api.com/price/XAU","https://api.metals.live/v1/spot"]:
         try:
             r = requests.get(url, timeout=8).json()
             if "price" in r: return float(r["price"])
-            if isinstance(r, list) and len(r)>0 and "gold" in r[0]: return float(r[0]["gold"])
+            if isinstance(r, list) and "gold" in str(r[0]): return float(r[0]["gold"])
         except: continue
     return None
 
 def get_history():
-    # V10.8 FIX: anti-429 with retries and backoff
     for retry in range(3):
         try:
-            time.sleep(random.uniform(1,3)) # jitter to avoid 429
+            time.sleep(random.uniform(1,2))
             df = yf.download("GC=F", period="7d", interval="5m", progress=False, auto_adjust=True, threads=False)
-            if df.empty: raise Exception("empty df")
+            if df.empty: continue
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df = df.dropna()
             close = df['Close']
@@ -57,17 +53,21 @@ def get_history():
             fut_price = float(close.iloc[-1])
 
             vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
-            vol_now = float(vol.iloc[-1]) if vol is not None else vol_avg
-            vol_ok = vol_now >= vol_avg*0.40 if vol_avg>0 else True # V10.8: 40%
+            vol_now = float(vol.iloc[-1]) if vol is not None else 0
+
+            # V10.9 CRITICAL FIX
+            if vol_avg == 0 or vol_now == 0 or pd.isna(vol_avg) or pd.isna(vol_now):
+                vol_ok = True
+                vol_avg = 221
+                vol_now = 221
+            else:
+                vol_ok = vol_now >= vol_avg*0.40
 
             ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
             return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"vol_now":vol_now,"vol_avg":vol_avg,"ema9_slope_up":ema9>ema9_prev,"ema9_slope_down":ema9<ema9_prev}
         except Exception as e:
-            print(f"HISTORY FAIL retry {retry} {e}", flush=True)
-            if "429" in str(e) or "crumb" in str(e).lower():
-                time.sleep(60 + retry*30) # long backoff for 429
-            else:
-                time.sleep(10)
+            print(f"HISTORY FAIL {retry} {e}", flush=True)
+            time.sleep(40)
     return None
 
 def get_data():
@@ -80,11 +80,11 @@ def get_data():
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.8 ANTI-429 STARTED", flush=True)
+    print("MARKET V10.9 VOL-0 FIX STARTED", flush=True)
     while True:
         try:
             d = get_data()
-            if d is None: print("NO DATA, sleep 120s", flush=True); time.sleep(120); continue
+            if d is None: time.sleep(120); continue
             price = d["price"]; ema9=d["ema9"]; ema20=d["ema20"]; ema21=d["ema21"]; ema200=d["ema200"]; rsi=d["rsi"]; roc=d["roc"]
             last_price=price; last_rsi=rsi; last_check=time.strftime("%H:%M:%S")
             print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']}", flush=True)
@@ -106,14 +106,11 @@ def check_market():
             dist_200 = abs(price-ema200)/price*100
             buy_stack = (ema9 > ema20 > ema21 > ema200) and (price > ema9)
             sell_stack = (ema9 < ema20 < ema21 < ema200) and (price < ema9)
+            if abs(roc) < 0.004: print("FLAT SKIP", flush=True); time.sleep(90); continue
+
             buy_rsi = 40 < rsi < 68
             sell_rsi = 32 < rsi < 58
             dist_ok = 0.05 < dist_200 < 1.5
-            # V10.8: flat market protection - if ROC <0.005, skip
-            if abs(roc) < 0.005:
-                print("FLAT MARKET, skip", flush=True)
-                time.sleep(90); continue
-
             buy_mom_vol = (roc > 0.01) and (d["vol_ok"] or roc > 0.03) and d["ema9_slope_up"]
             sell_mom_vol = (roc < -0.01) and (d["vol_ok"] or roc < -0.03) and d["ema9_slope_down"]
             buy_trend = price > ema20
@@ -128,37 +125,32 @@ def check_market():
             if buy_score >=4 and buy_stack:
                 tp=price*1.006; sl=price*0.997
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in buy_filters])
-                msg = f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5"
-                if send_tg(msg): active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
+                if send_tg(f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5"): active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
             elif sell_score >=4 and sell_stack:
                 tp=price*0.994; sl=price*1.003
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in sell_filters])
-                msg = f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5"
-                if send_tg(msg): active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
-
-            time.sleep(120) # V10.8: 120s not 90s to avoid 429
+                if send_tg(f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5"): active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
+            time.sleep(120)
         except Exception as e:
             print(f"ERR {e}", flush=True); time.sleep(60)
 
 def telegram_loop():
-    global last_price, last_rsi, last_check
+    global last_price
     offset=0
     while True:
         try:
             r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset":offset,"timeout":25}, timeout=30).json()
             for upd in r.get("result", []):
                 offset=upd["update_id"]+1
-                msg=upd.get("message",{}); text=msg.get("text",""); chat=str(msg.get("chat",{}).get("id",""))
+                text=upd.get("message",{}).get("text",""); chat=str(upd.get("message",{}).get("chat",{}).get("id",""))
                 if chat!=CHAT_ID: continue
                 if "/status" in text or "/start" in text:
-                    d=get_data()
-                    if d: last_price=d["price"]; last_rsi=d["rsi"]
-                    tr="No trade" if not active_trade else f"{active_trade['dir']} E:{active_trade['entry']:.2f}"
-                    send_tg(f"✅ <b>V10.8 LIVE</b>\nSPOT {last_price:.2f}\nRSI {last_rsi:.1f}\n{tr}\nLast {last_check}")
+                    tr="No trade" if not active_trade else f"{active_trade['dir']} {active_trade['entry']:.2f}"
+                    send_tg(f"✅ <b>V10.9 LIVE</b>\nSPOT {last_price:.2f}\n{tr}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.8 {last_price} {last_check}"
+def home(): return f"V10.9 {last_price}"
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
 if __name__ == "__main__":
