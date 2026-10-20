@@ -18,17 +18,20 @@ def send_tg(text):
         try:
             r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=12)
-            if r.status_code == 200: return True
-        except: pass
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"SEND FAIL {e}", flush=True)
         time.sleep(2)
     return False
 
 def get_spot_price():
-    for url in ["https://api.gold-api.com/price/XAU","https://api.metals.live/v1/spot"]:
+    urls = ["https://api.gold-api.com/price/XAU","https://api.metals.live/v1/spot"]
+    for url in urls:
         try:
             r = requests.get(url, timeout=8).json()
             if "price" in r: return float(r["price"])
-            if isinstance(r, list) and "gold" in str(r[0]): return float(r[0]["gold"])
+            if isinstance(r, list) and len(r)>0 and "gold" in r[0]: return float(r[0]["gold"])
         except: continue
     return None
 
@@ -55,18 +58,18 @@ def get_history():
             vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
             vol_now = float(vol.iloc[-1]) if vol is not None else 0
 
-            # V10.9 CRITICAL FIX
+            # V11 KOYEB FIX: Yahoo sometimes returns 0 volume
             if vol_avg == 0 or vol_now == 0 or pd.isna(vol_avg) or pd.isna(vol_now):
                 vol_ok = True
-                vol_avg = 221
-                vol_now = 221
+                vol_avg = 200
+                vol_now = 200
             else:
                 vol_ok = vol_now >= vol_avg*0.40
 
             ema9_prev = float(ta.trend.ema_indicator(close, window=9).iloc[-2])
             return {"ema9":ema9,"ema20":ema20,"ema21":ema21,"ema200":ema200,"rsi":rsi,"roc":roc,"fut_price":fut_price,"vol_ok":vol_ok,"vol_now":vol_now,"vol_avg":vol_avg,"ema9_slope_up":ema9>ema9_prev,"ema9_slope_down":ema9<ema9_prev}
         except Exception as e:
-            print(f"HISTORY FAIL {retry} {e}", flush=True)
+            print(f"HISTORY FAIL retry {retry} {e}", flush=True)
             time.sleep(40)
     return None
 
@@ -80,7 +83,7 @@ def get_data():
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V10.9 VOL-0 FIX STARTED", flush=True)
+    print("MARKET V11 KOYEB FIX STARTED", flush=True)
     while True:
         try:
             d = get_data()
@@ -146,12 +149,15 @@ def telegram_loop():
                 if chat!=CHAT_ID: continue
                 if "/status" in text or "/start" in text:
                     tr="No trade" if not active_trade else f"{active_trade['dir']} {active_trade['entry']:.2f}"
-                    send_tg(f"✅ <b>V10.9 LIVE</b>\nSPOT {last_price:.2f}\n{tr}")
+                    send_tg(f"✅ <b>V11 KOYEB LIVE</b>\nSPOT {last_price:.2f}\n{tr}\nLast {last_check}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V10.9 {last_price}"
+def home(): return f"V11 KOYEB {last_price} {last_check}"
+
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
